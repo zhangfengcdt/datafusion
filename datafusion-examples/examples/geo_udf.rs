@@ -12,40 +12,43 @@ use datafusion::prelude::*;
 use datafusion_common::cast::as_struct_array;
 use datafusion_expr::{ColumnarValue};
 use std::sync::Arc;
+use arrow::array::Array;
 use arrow_schema::Fields;
-
-// // Define a struct for the inputs
-// #[derive(Debug, Clone)]
-// struct PowerStruct {
-//     base: f64,
-//     exponent: f64,
-// }
+use datafusion_common::ScalarValue;
 
 // Create a local execution context with an in-memory table
 fn create_context() -> Result<SessionContext> {
-    // Define the base and exponent data
-    let base_values = vec![Some(2.1), Some(3.1), Some(4.1), Some(5.1)];
-    let exponent_values = vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)];
+    // Define x, y, z, m coordinate values (z and m are optional)
+    let x_values = vec![Some(2.1), Some(3.1), Some(4.1), Some(5.1)];
+    let y_values = vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)];
+    let z_values = vec![Some(1.5), Some(2.5),  Some(2.5),  Some(2.5)];
+    let m_values = vec![None, None, None, None];
 
     // Define the field types for the struct
     let struct_fields = vec![
-        Field::new("base", DataType::Float64, true),
-        Field::new("exponent", DataType::Float64, true),
+        Field::new("x", DataType::Float64, true),
+        Field::new("y", DataType::Float64, true),
+        Field::new("z", DataType::Float64, true),
+        Field::new("m", DataType::Float64, true),
     ];
 
-    // Create a StructBuilder with two fields (base and exponent)
+    // Create a StructBuilder with x, y, z, m fields
     let mut struct_builder = StructBuilder::new(
         struct_fields,
         vec![
+            Box::new(Float64Builder::new()) as Box<dyn arrow::array::ArrayBuilder>,
+            Box::new(Float64Builder::new()) as Box<dyn arrow::array::ArrayBuilder>,
             Box::new(Float64Builder::new()) as Box<dyn arrow::array::ArrayBuilder>,
             Box::new(Float64Builder::new()) as Box<dyn arrow::array::ArrayBuilder>,
         ],
     );
 
     // Add values to the StructBuilder
-    for (base, exponent) in base_values.iter().zip(exponent_values.iter()) {
-        struct_builder.field_builder::<Float64Builder>(0).unwrap().append_option(*base);
-        struct_builder.field_builder::<Float64Builder>(1).unwrap().append_option(*exponent);
+    for ((x, y), (z, m)) in x_values.iter().zip(y_values.iter()).zip(z_values.iter().zip(m_values.iter())) {
+        struct_builder.field_builder::<Float64Builder>(0).unwrap().append_option(*x);
+        struct_builder.field_builder::<Float64Builder>(1).unwrap().append_option(*y);
+        struct_builder.field_builder::<Float64Builder>(2).unwrap().append_option(*z);
+        struct_builder.field_builder::<Float64Builder>(3).unwrap().append_option(*m);
         struct_builder.append(true); // Mark the struct entry as valid
     }
 
@@ -53,7 +56,7 @@ fn create_context() -> Result<SessionContext> {
     let struct_array = struct_builder.finish();
 
     // Create a RecordBatch with the StructArray
-    let batch = RecordBatch::try_from_iter(vec![("values", Arc::new(struct_array) as ArrayRef)])?;
+    let batch = RecordBatch::try_from_iter(vec![("coordinates", Arc::new(struct_array) as ArrayRef)])?;
 
     // Create a session context and register the batch
     let ctx = SessionContext::new();
@@ -61,37 +64,89 @@ fn create_context() -> Result<SessionContext> {
     Ok(ctx)
 }
 
-// Example of a UDF that takes a struct instead of two floats
+// UDF that takes a struct and an offset, moves the point by the offset
 #[tokio::main]
 async fn main() -> Result<()> {
     let ctx = create_context()?;
 
     // Define the UDF logic
-    let power_struct_udf = Arc::new(|args: &[ColumnarValue]| -> Result<ColumnarValue> {
-        assert_eq!(args.len(), 1);
+    let st_move_udf = Arc::new(|args: &[ColumnarValue]| -> Result<ColumnarValue> {
+        assert_eq!(args.len(), 2);
+
+        let offset = match &args[1] {
+            ColumnarValue::Scalar(ScalarValue::Float64(Some(v))) => *v, // Dereference the value
+            ColumnarValue::Scalar(ScalarValue::Float64(None)) => {
+                return Err(datafusion::error::DataFusionError::Execution("Offset is None".to_string()))
+            },
+            _ => {
+                return Err(datafusion::error::DataFusionError::Execution("Expected a Float64 scalar for the offset".to_string()))
+            }
+        };
 
         // Handle only the case where the input is an array (not a scalar)
         match &args[0] {
             ColumnarValue::Array(array) => {
                 let struct_array = as_struct_array(array)?;
 
-                let base_array = struct_array.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
-                let exponent_array = struct_array.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+                let x_array = struct_array.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+                let y_array = struct_array.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+                let z_array = struct_array.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+                // let m_array = struct_array.column(3).as_any().downcast_ref::<Float64Array>().unwrap();
 
-                assert_eq!(base_array.len(), exponent_array.len());
+                assert_eq!(x_array.len(), y_array.len());
+                assert_eq!(x_array.len(), z_array.len());
 
-                let result_array: Float64Array = base_array
-                    .iter()
-                    .zip(exponent_array.iter())
-                    .map(|(base, exponent)| {
-                        match (base, exponent) {
-                            (Some(base), Some(exponent)) => Some(base.powf(exponent)),
-                            _ => None, // Return None if either base or exponent is null
-                        }
-                    })
-                    .collect();
+                // Apply the offset to x, y, z, and m coordinates
+                let x_builder = Float64Builder::new();
+                let y_builder = Float64Builder::new();
+                let z_builder = Float64Builder::new();
 
-                Ok(ColumnarValue::Array(Arc::new(result_array) as ArrayRef))
+                // Initialize the field definitions (schema) for x, y, and z
+                let struct_fields = vec![
+                    Field::new("x", DataType::Float64, true),
+                    Field::new("y", DataType::Float64, true),
+                    Field::new("z", DataType::Float64, true),
+                ];
+
+                // Combine the field definitions and builders into a StructBuilder
+                let mut struct_builder = StructBuilder::new(
+                    struct_fields,
+                    vec![
+                        Box::new(x_builder) as Box<dyn arrow::array::ArrayBuilder>,
+                        Box::new(y_builder) as Box<dyn arrow::array::ArrayBuilder>,
+                        Box::new(z_builder) as Box<dyn arrow::array::ArrayBuilder>,
+                    ],
+                );
+
+                for i in 0..x_array.len() {
+                    // Append values to x
+                    if x_array.is_valid(i) {
+                        struct_builder.field_builder::<Float64Builder>(0).unwrap().append_value(x_array.value(i) + offset);
+                    } else {
+                        struct_builder.field_builder::<Float64Builder>(0).unwrap().append_null();
+                    }
+
+                    // Append values to y
+                    if y_array.is_valid(i) {
+                        struct_builder.field_builder::<Float64Builder>(1).unwrap().append_value(y_array.value(i) + offset);
+                    } else {
+                        struct_builder.field_builder::<Float64Builder>(1).unwrap().append_null();
+                    }
+
+                    // Append values to z
+                    if z_array.is_valid(i) {
+                        struct_builder.field_builder::<Float64Builder>(2).unwrap().append_value(z_array.value(i) + offset);
+                    } else {
+                        struct_builder.field_builder::<Float64Builder>(2).unwrap().append_null();
+                    }
+
+                    // After appending all fields for the current row, mark the struct entry as valid
+                    struct_builder.append(true);  // Mark this row as valid
+                }
+
+                let result_struct = struct_builder.finish();
+
+                Ok(ColumnarValue::Array(Arc::new(result_struct) as ArrayRef))
             }
             _ => Err(datafusion::error::DataFusionError::Execution(
                 "Expected an array input, but got a scalar.".to_string(),
@@ -99,26 +154,35 @@ async fn main() -> Result<()> {
         }
     });
 
-    let power_struct_udf = create_udf(
-        "power_struct",
+    let st_move_udf = create_udf(
+        "st_move",
         vec![DataType::Struct(Fields::from(vec![
-            Field::new("base", DataType::Float64, true),
-            Field::new("exponent", DataType::Float64, true),
-        ]))],
-        Arc::new(DataType::Float64),
+            Field::new("x", DataType::Float64, true),
+            Field::new("y", DataType::Float64, true),
+            Field::new("z", DataType::Float64, true),
+            Field::new("m", DataType::Float64, true),
+        ])), DataType::Float64],
+        Arc::new(DataType::Struct(Fields::from(vec![
+            Field::new("x", DataType::Float64, true),
+            Field::new("y", DataType::Float64, true),
+            Field::new("z", DataType::Float64, true),
+            // Field::new("m", DataType::Float64, true),
+        ]))),
         Volatility::Immutable,
-        power_struct_udf,
+        st_move_udf,
     );
 
-    ctx.register_udf(power_struct_udf.clone());
+    ctx.register_udf(st_move_udf.clone());
 
     // Use the UDF in a query
     let df = ctx.table("t").await?;
-    let expr = power_struct_udf.call(vec![col("values")]);
+    let expr = st_move_udf.call(vec![col("coordinates"), lit(2.0)]);
 
-    let df = df.select(vec![expr])?;
+    let df2 = df.clone().select(vec![expr])?;
 
-    df.show().await?;
+    df.clone().show().await?;
+
+    df2.show().await?;
 
     Ok(())
 }
