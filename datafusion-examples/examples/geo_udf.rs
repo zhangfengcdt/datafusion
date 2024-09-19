@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
                 let x_array = struct_array.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
                 let y_array = struct_array.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
                 let z_array = struct_array.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
-                // let m_array = struct_array.column(3).as_any().downcast_ref::<Float64Array>().unwrap();
+                let m_array = struct_array.column(3).as_any().downcast_ref::<Float64Array>().unwrap();
 
                 assert_eq!(x_array.len(), y_array.len());
                 assert_eq!(x_array.len(), z_array.len());
@@ -100,12 +100,14 @@ async fn main() -> Result<()> {
                 let x_builder = Float64Builder::new();
                 let y_builder = Float64Builder::new();
                 let z_builder = Float64Builder::new();
+                let m_builder = Float64Builder::new();
 
                 // Initialize the field definitions (schema) for x, y, and z
                 let struct_fields = vec![
                     Field::new("x", DataType::Float64, true),
                     Field::new("y", DataType::Float64, true),
                     Field::new("z", DataType::Float64, true),
+                    Field::new("m", DataType::Float64, true),
                 ];
 
                 // Combine the field definitions and builders into a StructBuilder
@@ -115,6 +117,7 @@ async fn main() -> Result<()> {
                         Box::new(x_builder) as Box<dyn arrow::array::ArrayBuilder>,
                         Box::new(y_builder) as Box<dyn arrow::array::ArrayBuilder>,
                         Box::new(z_builder) as Box<dyn arrow::array::ArrayBuilder>,
+                        Box::new(m_builder) as Box<dyn arrow::array::ArrayBuilder>,
                     ],
                 );
 
@@ -138,6 +141,13 @@ async fn main() -> Result<()> {
                         struct_builder.field_builder::<Float64Builder>(2).unwrap().append_value(z_array.value(i) + offset);
                     } else {
                         struct_builder.field_builder::<Float64Builder>(2).unwrap().append_null();
+                    }
+
+                    // Append values to z
+                    if m_array.is_valid(i) {
+                        struct_builder.field_builder::<Float64Builder>(3).unwrap().append_value(m_array.value(i) + offset);
+                    } else {
+                        struct_builder.field_builder::<Float64Builder>(3).unwrap().append_null();
                     }
 
                     // After appending all fields for the current row, mark the struct entry as valid
@@ -166,7 +176,7 @@ async fn main() -> Result<()> {
             Field::new("x", DataType::Float64, true),
             Field::new("y", DataType::Float64, true),
             Field::new("z", DataType::Float64, true),
-            // Field::new("m", DataType::Float64, true),
+            Field::new("m", DataType::Float64, true),
         ]))),
         Volatility::Immutable,
         st_move_udf,
