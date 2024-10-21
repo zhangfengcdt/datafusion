@@ -1526,6 +1526,9 @@ NULL NULL
 query error DataFusion error: Error during planning: Negation only supports numeric, interval and timestamp types
 SELECT -'100'
 
+query error DataFusion error: Error during planning: Unary operator '\+' only supports numeric, interval and timestamp types
+SELECT +true
+
 statement ok
 drop table test_boolean
 
@@ -1906,10 +1909,8 @@ select position('' in '')
 ----
 1
 
-
-query error DataFusion error: Execution error: The STRPOS/INSTR/POSITION function can only accept strings, but got Int64.
+query error DataFusion error: Error during planning: Error during planning: Int64 and Int64 are not coercible to a common string
 select position(1 in 1)
-
 
 query I
 select strpos('abc', 'c');

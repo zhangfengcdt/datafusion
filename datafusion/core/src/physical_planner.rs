@@ -71,20 +71,21 @@ use datafusion_common::{
     exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_err, DFSchema,
     ScalarValue,
 };
-use datafusion_expr::dml::CopyTo;
+use datafusion_expr::dml::{CopyTo, InsertOp};
 use datafusion_expr::expr::{
     physical_name, AggregateFunction, Alias, GroupingSet, WindowFunction,
 };
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessary;
 use datafusion_expr::{
-    DescribeTable, DmlStatement, Extension, Filter, RecursiveQuery, SortExpr,
+    DescribeTable, DmlStatement, Extension, Filter, JoinType, RecursiveQuery, SortExpr,
     StringifiedPlan, WindowFrame, WindowFrameBound, WriteOp,
 };
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::expressions::Literal;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
+use datafusion_physical_plan::unnest::ListUnnest;
 use datafusion_sql::utils::window_expr_common_partition_keys;
 
 use async_trait::async_trait;
@@ -429,7 +430,7 @@ impl DefaultPhysicalPlanner {
         Ok(Some(plan))
     }
 
-    /// Given a single LogicalPlan node, map it to it's physical ExecutionPlan counterpart.
+    /// Given a single LogicalPlan node, map it to its physical ExecutionPlan counterpart.
     async fn map_logical_node_to_physical(
         &self,
         node: &LogicalPlan,
@@ -528,7 +529,7 @@ impl DefaultPhysicalPlanner {
                     file_groups: vec![],
                     output_schema: Arc::new(schema),
                     table_partition_cols,
-                    overwrite: false,
+                    insert_op: InsertOp::Append,
                     keep_partition_by_columns,
                 };
 
@@ -541,7 +542,7 @@ impl DefaultPhysicalPlanner {
             }
             LogicalPlan::Dml(DmlStatement {
                 table_name,
-                op: WriteOp::InsertInto,
+                op: WriteOp::Insert(insert_op),
                 ..
             }) => {
                 let name = table_name.table();
@@ -549,23 +550,7 @@ impl DefaultPhysicalPlanner {
                 if let Some(provider) = schema.table(name).await? {
                     let input_exec = children.one()?;
                     provider
-                        .insert_into(session_state, input_exec, false)
-                        .await?
-                } else {
-                    return exec_err!("Table '{table_name}' does not exist");
-                }
-            }
-            LogicalPlan::Dml(DmlStatement {
-                table_name,
-                op: WriteOp::InsertOverwrite,
-                ..
-            }) => {
-                let name = table_name.table();
-                let schema = session_state.schema_for_ref(table_name.clone())?;
-                if let Some(provider) = schema.table(name).await? {
-                    let input_exec = children.one()?;
-                    provider
-                        .insert_into(session_state, input_exec, true)
+                        .insert_into(session_state, input_exec, *insert_op)
                         .await?
                 } else {
                     return exec_err!("Table '{table_name}' does not exist");
@@ -707,10 +692,6 @@ impl DefaultPhysicalPlanner {
                     physical_input_schema.clone(),
                 )?);
 
-                // update group column indices based on partial aggregate plan evaluation
-                let final_group: Vec<Arc<dyn PhysicalExpr>> =
-                    initial_aggr.output_group_expr();
-
                 let can_repartition = !groups.is_empty()
                     && session_state.config().target_partitions() > 1
                     && session_state.config().repartition_aggregations();
@@ -731,13 +712,7 @@ impl DefaultPhysicalPlanner {
                     AggregateMode::Final
                 };
 
-                let final_grouping_set = PhysicalGroupBy::new_single(
-                    final_group
-                        .iter()
-                        .enumerate()
-                        .map(|(i, expr)| (expr.clone(), groups.expr()[i].1.clone()))
-                        .collect(),
-                );
+                let final_grouping_set = initial_aggr.group_expr().as_final();
 
                 Arc::new(AggregateExec::try_new(
                     next_partition_mode,
@@ -848,9 +823,16 @@ impl DefaultPhysicalPlanner {
             }) => {
                 let input = children.one()?;
                 let schema = SchemaRef::new(schema.as_ref().to_owned().into());
+                let list_column_indices = list_type_columns
+                    .iter()
+                    .map(|(index, unnesting)| ListUnnest {
+                        index_in_input_schema: *index,
+                        depth: unnesting.depth,
+                    })
+                    .collect();
                 Arc::new(UnnestExec::new(
                     input,
-                    list_type_columns.clone(),
+                    list_column_indices,
                     struct_type_columns.clone(),
                     schema,
                     options.clone(),
@@ -1063,14 +1045,18 @@ impl DefaultPhysicalPlanner {
                     session_state.config_options().optimizer.prefer_hash_join;
 
                 let join: Arc<dyn ExecutionPlan> = if join_on.is_empty() {
-                    // there is no equal join condition, use the nested loop join
-                    // TODO optimize the plan, and use the config of `target_partitions` and `repartition_joins`
-                    Arc::new(NestedLoopJoinExec::try_new(
-                        physical_left,
-                        physical_right,
-                        join_filter,
-                        join_type,
-                    )?)
+                    if join_filter.is_none() && matches!(join_type, JoinType::Inner) {
+                        // cross join if there is no join conditions and no join filter set
+                        Arc::new(CrossJoinExec::new(physical_left, physical_right))
+                    } else {
+                        // there is no equal join condition, use the nested loop join
+                        Arc::new(NestedLoopJoinExec::try_new(
+                            physical_left,
+                            physical_right,
+                            join_filter,
+                            join_type,
+                        )?)
+                    }
                 } else if session_state.config().target_partitions() > 1
                     && session_state.config().repartition_joins()
                     && !prefer_hash_join
@@ -1541,7 +1527,7 @@ pub fn create_window_expr(
 }
 
 type AggregateExprWithOptionalArgs = (
-    AggregateFunctionExpr,
+    Arc<AggregateFunctionExpr>,
     // The filter clause, if any
     Option<Arc<dyn PhysicalExpr>>,
     // Ordering requirements, if any
@@ -1605,7 +1591,8 @@ pub fn create_aggregate_expr_with_name_and_maybe_filter(
                         .alias(name)
                         .with_ignore_nulls(ignore_nulls)
                         .with_distinct(*distinct)
-                        .build()?;
+                        .build()
+                        .map(Arc::new)?;
 
                 (agg_expr, filter, physical_sort_exprs)
             };
@@ -1974,6 +1961,7 @@ fn tuple_err<T, R>(value: (Result<T>, Result<R>)) -> Result<(T, R)> {
 #[cfg(test)]
 mod tests {
     use std::any::Any;
+    use std::cmp::Ordering;
     use std::fmt::{self, Debug};
     use std::ops::{BitAnd, Not};
 
@@ -2352,7 +2340,7 @@ mod tests {
             .expect("hash aggregate");
         assert_eq!(
             "sum(aggregate_test_100.c3)",
-            final_hash_agg.schema().field(2).name()
+            final_hash_agg.schema().field(3).name()
         );
         // we need access to the input to the partial aggregate so that other projects can
         // implement serde
@@ -2528,6 +2516,14 @@ mod tests {
         }
     }
 
+    // Implementation needed for `UserDefinedLogicalNodeCore`, since the only field is
+    // a schema, we can't derive `PartialOrd`, and we can't compare these.
+    impl PartialOrd for NoOpExtensionNode {
+        fn partial_cmp(&self, _other: &Self) -> Option<Ordering> {
+            None
+        }
+    }
+
     impl UserDefinedLogicalNodeCore for NoOpExtensionNode {
         fn name(&self) -> &str {
             "NoOp"
@@ -2555,6 +2551,10 @@ mod tests {
             _inputs: Vec<LogicalPlan>,
         ) -> Result<Self> {
             unimplemented!("NoOp");
+        }
+
+        fn supports_limit_pushdown(&self) -> bool {
+            false // Disallow limit push-down by default
         }
     }
 

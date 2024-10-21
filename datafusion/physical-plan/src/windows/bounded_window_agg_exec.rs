@@ -42,15 +42,15 @@ use crate::{
 use ahash::RandomState;
 use arrow::{
     array::{Array, ArrayRef, RecordBatchOptions, UInt32Builder},
-    compute::{concat, concat_batches, sort_to_indices},
+    compute::{concat, concat_batches, sort_to_indices, take_arrays},
     datatypes::SchemaRef,
     record_batch::RecordBatch,
 };
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::stats::Precision;
 use datafusion_common::utils::{
-    evaluate_partition_ranges, get_arrayref_at_indices, get_at_indices,
-    get_record_batch_at_indices, get_row_at_idx,
+    evaluate_partition_ranges, get_at_indices, get_record_batch_at_indices,
+    get_row_at_idx,
 };
 use datafusion_common::{arrow_datafusion_err, exec_err, DataFusionError, Result};
 use datafusion_execution::TaskContext;
@@ -257,17 +257,11 @@ impl ExecutionPlan for BoundedWindowAggExec {
     fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
         let partition_bys = self.window_expr()[0].partition_by();
         let order_keys = self.window_expr()[0].order_by();
-        if self.input_order_mode != InputOrderMode::Sorted
-            || self.ordered_partition_by_indices.len() >= partition_bys.len()
-        {
-            let partition_bys = self
-                .ordered_partition_by_indices
-                .iter()
-                .map(|idx| &partition_bys[*idx]);
-            vec![calc_requirements(partition_bys, order_keys)]
-        } else {
-            vec![calc_requirements(partition_bys, order_keys)]
-        }
+        let partition_bys = self
+            .ordered_partition_by_indices
+            .iter()
+            .map(|idx| &partition_bys[*idx]);
+        vec![calc_requirements(partition_bys, order_keys)]
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
@@ -542,7 +536,9 @@ impl PartitionSearcher for LinearSearch {
         // We should emit columns according to row index ordering.
         let sorted_indices = sort_to_indices(&all_indices, None, None)?;
         // Construct new column according to row ordering. This fixes ordering
-        get_arrayref_at_indices(&new_columns, &sorted_indices).map(Some)
+        take_arrays(&new_columns, &sorted_indices, None)
+            .map(Some)
+            .map_err(|e| arrow_datafusion_err!(e))
     }
 
     fn evaluate_partition_batches(

@@ -312,6 +312,7 @@ fn make_topk_context() -> SessionContext {
 
 // ------ The implementation of the TopK code follows -----
 
+#[derive(Debug)]
 struct TopKQueryPlanner {}
 
 #[async_trait]
@@ -335,7 +336,9 @@ impl QueryPlanner for TopKQueryPlanner {
     }
 }
 
+#[derive(Default, Debug)]
 struct TopKOptimizerRule {}
+
 impl OptimizerRule for TopKOptimizerRule {
     fn name(&self) -> &str {
         "topk"
@@ -387,7 +390,7 @@ impl OptimizerRule for TopKOptimizerRule {
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, PartialOrd, Hash)]
 struct TopKPlanNode {
     k: usize,
     input: LogicalPlan,
@@ -439,6 +442,10 @@ impl UserDefinedLogicalNodeCore for TopKPlanNode {
             input: inputs.swap_remove(0),
             expr: replace_sort_expression(self.expr.clone(), exprs.swap_remove(0)),
         })
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false // Disallow limit push-down by default
     }
 }
 
@@ -686,6 +693,7 @@ impl RecordBatchStream for TopKReader {
     }
 }
 
+#[derive(Default, Debug)]
 struct MyAnalyzerRule {}
 
 impl AnalyzerRule for MyAnalyzerRule {

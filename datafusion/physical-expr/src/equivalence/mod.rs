@@ -48,7 +48,7 @@ pub fn collapse_lex_req(input: LexRequirement) -> LexRequirement {
             output.push(item);
         }
     }
-    output
+    LexRequirement::new(output)
 }
 
 /// Adds the `offset` value to `Column` indices inside `expr`. This function is
@@ -72,6 +72,7 @@ pub fn add_offset_to_expr(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::expressions::col;
     use crate::PhysicalSortExpr;
@@ -84,7 +85,6 @@ mod tests {
 
     use itertools::izip;
     use rand::rngs::StdRng;
-    use rand::seq::SliceRandom;
     use rand::{Rng, SeedableRng};
 
     pub fn output_schema(
@@ -175,67 +175,6 @@ mod tests {
         Ok((test_schema, eq_properties))
     }
 
-    // Generate a schema which consists of 6 columns (a, b, c, d, e, f)
-    fn create_test_schema_2() -> Result<SchemaRef> {
-        let a = Field::new("a", DataType::Float64, true);
-        let b = Field::new("b", DataType::Float64, true);
-        let c = Field::new("c", DataType::Float64, true);
-        let d = Field::new("d", DataType::Float64, true);
-        let e = Field::new("e", DataType::Float64, true);
-        let f = Field::new("f", DataType::Float64, true);
-        let schema = Arc::new(Schema::new(vec![a, b, c, d, e, f]));
-
-        Ok(schema)
-    }
-
-    /// Construct a schema with random ordering
-    /// among column a, b, c, d
-    /// where
-    /// Column [a=f] (e.g they are aliases).
-    /// Column e is constant.
-    pub fn create_random_schema(seed: u64) -> Result<(SchemaRef, EquivalenceProperties)> {
-        let test_schema = create_test_schema_2()?;
-        let col_a = &col("a", &test_schema)?;
-        let col_b = &col("b", &test_schema)?;
-        let col_c = &col("c", &test_schema)?;
-        let col_d = &col("d", &test_schema)?;
-        let col_e = &col("e", &test_schema)?;
-        let col_f = &col("f", &test_schema)?;
-        let col_exprs = [col_a, col_b, col_c, col_d, col_e, col_f];
-
-        let mut eq_properties = EquivalenceProperties::new(Arc::clone(&test_schema));
-        // Define a and f are aliases
-        eq_properties.add_equal_conditions(col_a, col_f)?;
-        // Column e has constant value.
-        eq_properties = eq_properties.add_constants([ConstExpr::from(col_e)]);
-
-        // Randomly order columns for sorting
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut remaining_exprs = col_exprs[0..4].to_vec(); // only a, b, c, d are sorted
-
-        let options_asc = SortOptions {
-            descending: false,
-            nulls_first: false,
-        };
-
-        while !remaining_exprs.is_empty() {
-            let n_sort_expr = rng.gen_range(0..remaining_exprs.len() + 1);
-            remaining_exprs.shuffle(&mut rng);
-
-            let ordering = remaining_exprs
-                .drain(0..n_sort_expr)
-                .map(|expr| PhysicalSortExpr {
-                    expr: Arc::clone(expr),
-                    options: options_asc,
-                })
-                .collect();
-
-            eq_properties.add_new_orderings([ordering]);
-        }
-
-        Ok((test_schema, eq_properties))
-    }
-
     // Convert each tuple to PhysicalSortRequirement
     pub fn convert_to_sort_reqs(
         in_data: &[(&Arc<dyn PhysicalExpr>, Option<SortOptions>)],
@@ -292,33 +231,6 @@ mod tests {
             .iter()
             .map(|sort_exprs| convert_to_sort_exprs_owned(sort_exprs))
             .collect()
-    }
-
-    // Apply projection to the input_data, return projected equivalence properties and record batch
-    pub fn apply_projection(
-        proj_exprs: Vec<(Arc<dyn PhysicalExpr>, String)>,
-        input_data: &RecordBatch,
-        input_eq_properties: &EquivalenceProperties,
-    ) -> Result<(RecordBatch, EquivalenceProperties)> {
-        let input_schema = input_data.schema();
-        let projection_mapping = ProjectionMapping::try_new(&proj_exprs, &input_schema)?;
-
-        let output_schema = output_schema(&projection_mapping, &input_schema)?;
-        let num_rows = input_data.num_rows();
-        // Apply projection to the input record batch.
-        let projected_values = projection_mapping
-            .iter()
-            .map(|(source, _target)| source.evaluate(input_data)?.into_array(num_rows))
-            .collect::<Result<Vec<_>>>()?;
-        let projected_batch = if projected_values.is_empty() {
-            RecordBatch::new_empty(Arc::clone(&output_schema))
-        } else {
-            RecordBatch::try_new(Arc::clone(&output_schema), projected_values)?
-        };
-
-        let projected_eq =
-            input_eq_properties.project(&projection_mapping, output_schema);
-        Ok((projected_batch, projected_eq))
     }
 
     #[test]
@@ -474,14 +386,6 @@ mod tests {
         let schema = eq_properties.schema();
         let mut schema_vec = vec![None; schema.fields.len()];
 
-        // Utility closure to generate random array
-        let mut generate_random_array = |num_elems: usize, max_val: usize| -> ArrayRef {
-            let values: Vec<f64> = (0..num_elems)
-                .map(|_| rng.gen_range(0..max_val) as f64 / 2.0)
-                .collect();
-            Arc::new(Float64Array::from_iter_values(values))
-        };
-
         // Fill constant columns
         for constant in &eq_properties.constants {
             let col = constant.expr().as_any().downcast_ref::<Column>().unwrap();
@@ -498,7 +402,7 @@ mod tests {
                 .map(|PhysicalSortExpr { expr, options }| {
                     let col = expr.as_any().downcast_ref::<Column>().unwrap();
                     let (idx, _field) = schema.column_with_name(col.name()).unwrap();
-                    let arr = generate_random_array(n_elem, n_distinct);
+                    let arr = generate_random_f64_array(n_elem, n_distinct, &mut rng);
                     (
                         SortColumn {
                             values: arr,
@@ -519,7 +423,9 @@ mod tests {
         for eq_group in eq_properties.eq_group.iter() {
             let representative_array =
                 get_representative_arr(eq_group, &schema_vec, Arc::clone(schema))
-                    .unwrap_or_else(|| generate_random_array(n_elem, n_distinct));
+                    .unwrap_or_else(|| {
+                        generate_random_f64_array(n_elem, n_distinct, &mut rng)
+                    });
 
             for expr in eq_group.iter() {
                 let col = expr.as_any().downcast_ref::<Column>().unwrap();
@@ -535,11 +441,25 @@ mod tests {
                 (
                     field.name(),
                     // Generate random values for columns that do not occur in any of the groups (equivalence, ordering equivalence, constants)
-                    elem.unwrap_or_else(|| generate_random_array(n_elem, n_distinct)),
+                    elem.unwrap_or_else(|| {
+                        generate_random_f64_array(n_elem, n_distinct, &mut rng)
+                    }),
                 )
             })
             .collect();
 
         Ok(RecordBatch::try_from_iter(res)?)
+    }
+
+    // Utility function to generate random f64 array
+    fn generate_random_f64_array(
+        n_elems: usize,
+        n_distinct: usize,
+        rng: &mut StdRng,
+    ) -> ArrayRef {
+        let values: Vec<f64> = (0..n_elems)
+            .map(|_| rng.gen_range(0..n_distinct) as f64 / 2.0)
+            .collect();
+        Arc::new(Float64Array::from_iter_values(values))
     }
 }

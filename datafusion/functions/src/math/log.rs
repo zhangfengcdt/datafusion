@@ -18,20 +18,22 @@
 //! Math function: `log()`.
 
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::power::PowerFunc;
 
-use arrow::array::{ArrayRef, Float32Array, Float64Array};
-use arrow::datatypes::DataType;
+use arrow::array::{ArrayRef, AsArray};
+use arrow::datatypes::{DataType, Float32Type, Float64Type};
 use datafusion_common::{
-    exec_err, internal_err, plan_datafusion_err, plan_err, DataFusionError, Result,
-    ScalarValue,
+    exec_err, internal_err, plan_datafusion_err, plan_err, Result, ScalarValue,
 };
 use datafusion_expr::expr::ScalarFunction;
+use datafusion_expr::scalar_doc_sections::DOC_SECTION_MATH;
 use datafusion_expr::simplify::{ExprSimplifyResult, SimplifyInfo};
 use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
-use datafusion_expr::{lit, ColumnarValue, Expr, ScalarUDF, TypeSignature::*};
+use datafusion_expr::{
+    lit, ColumnarValue, Documentation, Expr, ScalarUDF, TypeSignature::*,
+};
 use datafusion_expr::{ScalarUDFImpl, Signature, Volatility};
 
 #[derive(Debug)]
@@ -43,6 +45,22 @@ impl Default for LogFunc {
     fn default() -> Self {
         Self::new()
     }
+}
+
+static DOCUMENTATION: OnceLock<Documentation> = OnceLock::new();
+
+fn get_log_doc() -> &'static Documentation {
+    DOCUMENTATION.get_or_init(|| {
+        Documentation::builder()
+            .with_doc_section(DOC_SECTION_MATH)
+            .with_description("Returns the base-x logarithm of a number. Can either provide a specified base, or if omitted then takes the base-10 of a number.")
+            .with_syntax_example(r#"log(base, numeric_expression)
+log(numeric_expression)"#)
+            .with_standard_argument("base", Some("Base numeric"))
+            .with_standard_argument("numeric_expression", Some("Numeric"))
+            .build()
+            .unwrap()
+    })
 }
 
 impl LogFunc {
@@ -121,37 +139,40 @@ impl ScalarUDFImpl for LogFunc {
         let arr: ArrayRef = match args[0].data_type() {
             DataType::Float64 => match base {
                 ColumnarValue::Scalar(ScalarValue::Float32(Some(base))) => {
-                    Arc::new(make_function_scalar_inputs!(x, "x", Float64Array, {
-                        |value: f64| f64::log(value, base as f64)
-                    }))
+                    Arc::new(x.as_primitive::<Float64Type>().unary::<_, Float64Type>(
+                        |value: f64| f64::log(value, base as f64),
+                    ))
                 }
-                ColumnarValue::Array(base) => Arc::new(make_function_inputs2!(
-                    x,
-                    base,
-                    "x",
-                    "base",
-                    Float64Array,
-                    { f64::log }
-                )),
+                ColumnarValue::Array(base) => {
+                    let x = x.as_primitive::<Float64Type>();
+                    let base = base.as_primitive::<Float64Type>();
+                    let result = arrow::compute::binary::<_, _, _, Float64Type>(
+                        x,
+                        base,
+                        f64::log,
+                    )?;
+                    Arc::new(result) as _
+                }
                 _ => {
                     return exec_err!("log function requires a scalar or array for base")
                 }
             },
 
             DataType::Float32 => match base {
-                ColumnarValue::Scalar(ScalarValue::Float32(Some(base))) => {
-                    Arc::new(make_function_scalar_inputs!(x, "x", Float32Array, {
-                        |value: f32| f32::log(value, base)
-                    }))
+                ColumnarValue::Scalar(ScalarValue::Float32(Some(base))) => Arc::new(
+                    x.as_primitive::<Float32Type>()
+                        .unary::<_, Float32Type>(|value: f32| f32::log(value, base)),
+                ),
+                ColumnarValue::Array(base) => {
+                    let x = x.as_primitive::<Float32Type>();
+                    let base = base.as_primitive::<Float32Type>();
+                    let result = arrow::compute::binary::<_, _, _, Float32Type>(
+                        x,
+                        base,
+                        f32::log,
+                    )?;
+                    Arc::new(result) as _
                 }
-                ColumnarValue::Array(base) => Arc::new(make_function_inputs2!(
-                    x,
-                    base,
-                    "x",
-                    "base",
-                    Float32Array,
-                    { f32::log }
-                )),
                 _ => {
                     return exec_err!("log function requires a scalar or array for base")
                 }
@@ -162,6 +183,10 @@ impl ScalarUDFImpl for LogFunc {
         };
 
         Ok(ColumnarValue::Array(arr))
+    }
+
+    fn documentation(&self) -> Option<&Documentation> {
+        Some(get_log_doc())
     }
 
     /// Simplify the `log` function by the relevant rules:
@@ -236,6 +261,7 @@ mod tests {
 
     use super::*;
 
+    use arrow::array::{Float32Array, Float64Array};
     use arrow::compute::SortOptions;
     use datafusion_common::cast::{as_float32_array, as_float64_array};
     use datafusion_common::DFSchema;
