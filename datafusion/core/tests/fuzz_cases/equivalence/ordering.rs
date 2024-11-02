@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::fuzz_cases::equivalence::utils::{
-    convert_to_orderings, create_random_schema, create_test_schema_2,
+    convert_to_orderings, create_random_schema, create_test_params, create_test_schema_2,
     generate_table_for_eq_properties, generate_table_for_orderings,
     is_table_same_after_sort, TestScalarUDF,
 };
@@ -25,7 +25,7 @@ use datafusion_common::{DFSchema, Result};
 use datafusion_expr::{Operator, ScalarUDF};
 use datafusion_physical_expr::expressions::{col, BinaryExpr};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
-use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
+use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use itertools::Itertools;
 use std::sync::Arc;
 
@@ -62,7 +62,7 @@ fn test_ordering_satisfy_with_equivalence_random() -> Result<()> {
                         expr: Arc::clone(expr),
                         options: SORT_OPTIONS,
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<LexOrdering>();
                 let expected = is_table_same_after_sort(
                     requirement.clone(),
                     table_data_with_properties.clone(),
@@ -74,7 +74,7 @@ fn test_ordering_satisfy_with_equivalence_random() -> Result<()> {
                 // Check whether ordering_satisfy API result and
                 // experimental result matches.
                 assert_eq!(
-                    eq_properties.ordering_satisfy(&requirement),
+                    eq_properties.ordering_satisfy(requirement.as_ref()),
                     expected,
                     "{}",
                     err_msg
@@ -135,7 +135,7 @@ fn test_ordering_satisfy_with_equivalence_complex_random() -> Result<()> {
                         expr: Arc::clone(expr),
                         options: SORT_OPTIONS,
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<LexOrdering>();
                 let expected = is_table_same_after_sort(
                     requirement.clone(),
                     table_data_with_properties.clone(),
@@ -148,13 +148,184 @@ fn test_ordering_satisfy_with_equivalence_complex_random() -> Result<()> {
                 // experimental result matches.
 
                 assert_eq!(
-                    eq_properties.ordering_satisfy(&requirement),
+                    eq_properties.ordering_satisfy(requirement.as_ref()),
                     (expected | false),
                     "{}",
                     err_msg
                 );
             }
         }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_ordering_satisfy_with_equivalence() -> Result<()> {
+    // Schema satisfies following orderings:
+    // [a ASC], [d ASC, b ASC], [e DESC, f ASC, g ASC]
+    // and
+    // Column [a=c] (e.g they are aliases).
+    let (test_schema, eq_properties) = create_test_params()?;
+    let col_a = &col("a", &test_schema)?;
+    let col_b = &col("b", &test_schema)?;
+    let col_c = &col("c", &test_schema)?;
+    let col_d = &col("d", &test_schema)?;
+    let col_e = &col("e", &test_schema)?;
+    let col_f = &col("f", &test_schema)?;
+    let col_g = &col("g", &test_schema)?;
+
+    let option_asc = SortOptions {
+        descending: false,
+        nulls_first: false,
+    };
+
+    let option_desc = SortOptions {
+        descending: true,
+        nulls_first: true,
+    };
+    let table_data_with_properties =
+        generate_table_for_eq_properties(&eq_properties, 625, 5)?;
+
+    // First element in the tuple stores vector of requirement, second element is the expected return value for ordering_satisfy function
+    let requirements = vec![
+        // `a ASC NULLS LAST`, expects `ordering_satisfy` to be `true`, since existing ordering `a ASC NULLS LAST, b ASC NULLS LAST` satisfies it
+        (vec![(col_a, option_asc)], true),
+        (vec![(col_a, option_desc)], false),
+        // Test whether equivalence works as expected
+        (vec![(col_c, option_asc)], true),
+        (vec![(col_c, option_desc)], false),
+        // Test whether ordering equivalence works as expected
+        (vec![(col_d, option_asc)], true),
+        (vec![(col_d, option_asc), (col_b, option_asc)], true),
+        (vec![(col_d, option_desc), (col_b, option_asc)], false),
+        (
+            vec![
+                (col_e, option_desc),
+                (col_f, option_asc),
+                (col_g, option_asc),
+            ],
+            true,
+        ),
+        (vec![(col_e, option_desc), (col_f, option_asc)], true),
+        (vec![(col_e, option_asc), (col_f, option_asc)], false),
+        (vec![(col_e, option_desc), (col_b, option_asc)], false),
+        (vec![(col_e, option_asc), (col_b, option_asc)], false),
+        (
+            vec![
+                (col_d, option_asc),
+                (col_b, option_asc),
+                (col_d, option_asc),
+                (col_b, option_asc),
+            ],
+            true,
+        ),
+        (
+            vec![
+                (col_d, option_asc),
+                (col_b, option_asc),
+                (col_e, option_desc),
+                (col_f, option_asc),
+            ],
+            true,
+        ),
+        (
+            vec![
+                (col_d, option_asc),
+                (col_b, option_asc),
+                (col_e, option_desc),
+                (col_b, option_asc),
+            ],
+            true,
+        ),
+        (
+            vec![
+                (col_d, option_asc),
+                (col_b, option_asc),
+                (col_d, option_desc),
+                (col_b, option_asc),
+            ],
+            true,
+        ),
+        (
+            vec![
+                (col_d, option_asc),
+                (col_b, option_asc),
+                (col_e, option_asc),
+                (col_f, option_asc),
+            ],
+            false,
+        ),
+        (
+            vec![
+                (col_d, option_asc),
+                (col_b, option_asc),
+                (col_e, option_asc),
+                (col_b, option_asc),
+            ],
+            false,
+        ),
+        (vec![(col_d, option_asc), (col_e, option_desc)], true),
+        (
+            vec![
+                (col_d, option_asc),
+                (col_c, option_asc),
+                (col_b, option_asc),
+            ],
+            true,
+        ),
+        (
+            vec![
+                (col_d, option_asc),
+                (col_e, option_desc),
+                (col_f, option_asc),
+                (col_b, option_asc),
+            ],
+            true,
+        ),
+        (
+            vec![
+                (col_d, option_asc),
+                (col_e, option_desc),
+                (col_c, option_asc),
+                (col_b, option_asc),
+            ],
+            true,
+        ),
+        (
+            vec![
+                (col_d, option_asc),
+                (col_e, option_desc),
+                (col_b, option_asc),
+                (col_f, option_asc),
+            ],
+            true,
+        ),
+    ];
+
+    for (cols, expected) in requirements {
+        let err_msg = format!("Error in test case:{cols:?}");
+        let required = cols
+            .into_iter()
+            .map(|(expr, options)| PhysicalSortExpr {
+                expr: Arc::clone(expr),
+                options,
+            })
+            .collect::<LexOrdering>();
+
+        // Check expected result with experimental result.
+        assert_eq!(
+            is_table_same_after_sort(
+                required.clone(),
+                table_data_with_properties.clone()
+            )?,
+            expected
+        );
+        assert_eq!(
+            eq_properties.ordering_satisfy(required.as_ref()),
+            expected,
+            "{err_msg}"
+        );
     }
 
     Ok(())
