@@ -83,6 +83,12 @@ tokio = { workspace = true, features = ["rt-multi-thread", "parking_lot"] }
 tonic = "0.12.1"
 url = { workspace = true }
 uuid = "1.7"
+hex = "0.4"
+geo = { version = "0.28.0" }
+geo-types = { version = "0.7.13" }
+s2 = { version = "0.0.13"}
+byteorder = { version = "1.5.0" }
+wkt = { version = "0.11.1" }
 
 [target.'cfg(not(target_os = "windows"))'.dev-dependencies]
 nix = { version = "0.28.0", features = ["fs"] }
